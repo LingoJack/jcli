@@ -99,8 +99,8 @@ pub(super) fn handle_slash_popup(app: &mut ChatApp, key: KeyEvent) -> PopupResul
 
 /// 处理 @ 补全弹窗
 ///
-/// **性能关键**：`get_filtered_all_items()` 会递归扫描项目目录（max_depth=8），
-/// 在大项目中单次调用可达 100-500ms。必须延迟求值——只在 Up/Down/Tab/Enter
+/// **性能关键**：`get_filtered_all_items()` 基于内存文件索引做模糊匹配，
+/// 大项目上单次仍可达数毫秒到数十毫秒。必须延迟求值——只在 Up/Down/Tab/Enter
 /// 等真正需要过滤列表的分支内调用，绝不能提前到 match 之前。
 /// 否则每次按键（包括最终走 PassThrough 的普通字符）都会阻塞主循环，
 /// 导致输入卡顿/吞字符。
@@ -208,7 +208,7 @@ fn replace_at_with_prefix(app: &mut ChatApp, replacement: &str) {
 
 /// 处理文件补全弹窗
 ///
-/// **性能关键**：同 handle_at_popup，`get_filtered_files()` 会递归扫描项目目录，
+/// **性能关键**：同 handle_at_popup，`get_filtered_files()` 基于内存文件索引匹配，
 /// 必须延迟求值，不能提前到 match 之前调用。
 pub(super) fn handle_file_popup(app: &mut ChatApp, key: KeyEvent) -> PopupResult {
     let filtered;

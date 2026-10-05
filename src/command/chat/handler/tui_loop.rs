@@ -365,6 +365,13 @@ pub fn run_chat_tui_internal(ws_bridge: Option<WsBridge>) -> io::Result<()> {
 
             // 事件处理后若状态改变，立即渲染（避免因 poll_timeout 阻塞导致粘贴等操作延迟显示）
             if needs_redraw {
+                // 节流补齐：与 Phase 3 共用 30fps 上限，连续按键合并为一帧，
+                // 避免大仓库下弹窗过滤等重渲染开销被逐键放大。
+                // sleep 期间输入线程持续收集事件，不丢键。
+                let elapsed = last_render_time.elapsed();
+                if elapsed < RENDER_INTERVAL {
+                    std::thread::sleep(RENDER_INTERVAL - elapsed);
+                }
                 terminal.draw(|f| draw_chat_ui(f, &mut app))?;
                 needs_redraw = false;
                 last_render_time = std::time::Instant::now();

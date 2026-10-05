@@ -1,9 +1,14 @@
 //! 项目文件索引：维护内存中的文件路径列表，支持后台监控自动更新。
 //!
 //! 解决 @ 弹窗和文件弹窗每帧渲染时触发 WalkBuilder 扫描导致的性能问题。
+//!
+//! 性能设计：
+//! - 缓存以 `Arc<Vec<FileEntry>>` 快照持有，读方 clone Arc 为 O(1)，无深拷贝
+//! - FileEntry 预存小写副本（全路径 + 文件名），模糊匹配时零 to_lowercase 分配
+//! - 查询缓存：同一索引版本 + 同一过滤条件的重复查询（弹窗每帧渲染、上下键导航）直接复用结果
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,10 +20,55 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 /// 文件索引刷新间隔（秒）
 const REFRESH_CHECK_INTERVAL_SECS: u64 = 1;
 
+/// 文件名前缀匹配的评分加成（开头匹配优于包含匹配）
+const NAME_PREFIX_SCORE_BONUS: i32 = -50;
+
+/// 文件名包含匹配的评分加成
+const NAME_CONTAINS_SCORE_BONUS: i32 = -20;
+
+/// 代码类扩展名的评分加成
+const CODE_EXT_SCORE_BONUS: i32 = -15;
+
+/// 文档/配置类扩展名的评分加成
+const DOC_EXT_SCORE_BONUS: i32 = -10;
+
+/// 评分加成的代码类扩展名
+const SCORE_BOOSTED_CODE_EXTS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift",
+];
+
+/// 评分加成的文档/配置类扩展名
+const SCORE_BOOSTED_DOC_EXTS: &[&str] = &["json", "yaml", "yml", "toml", "md"];
+
+/// watcher 忽略的构建产物目录段（变化频繁，无需触发索引刷新）
+const BUILD_DIR_SEGMENTS: &[&str] = &["target", "node_modules", "dist", "build"];
+
+/// 索引条目：显示路径 + 预生成的小写副本（匹配与排序时零分配）
+struct FileEntry {
+    /// 显示用相对路径（目录以 '/' 结尾）
+    display: String,
+    /// display 的小写副本（排序与路径匹配用）
+    lower: String,
+    /// 文件名部分的小写副本（模糊匹配用）
+    name_lower: String,
+}
+
+/// 查询缓存：索引版本 + 过滤条件 + 结果
+struct SearchCache {
+    version: u64,
+    filter: String,
+    max_results: usize,
+    results: Vec<String>,
+}
+
 /// 项目文件索引：维护一个内存中的文件路径列表
 pub struct FileIndex {
-    /// 缓存的相对文件路径列表（目录以 '/' 结尾）
-    files: Arc<Mutex<Vec<String>>>,
+    /// 缓存的文件条目快照（读方 clone Arc 为 O(1)，写方整体替换）
+    entries: Arc<Mutex<Arc<Vec<FileEntry>>>>,
+    /// 缓存版本号（每次快照替换后 +1，用于查询缓存失效）
+    version: Arc<AtomicU64>,
+    /// 最近一次查询的缓存
+    search_cache: Mutex<Option<SearchCache>>,
     /// 上次完整扫描时间
     #[allow(dead_code)]
     last_scan: Arc<Mutex<Instant>>,
@@ -38,7 +88,9 @@ impl FileIndex {
     /// 首次扫描在后台线程执行，不阻塞主线程。
     /// 文件监控使用 notify crate 监听项目目录变化。
     pub fn new() -> Self {
-        let files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let entries: Arc<Mutex<Arc<Vec<FileEntry>>>> =
+            Arc::new(Mutex::new(Arc::new(Vec::new())));
+        let version = Arc::new(AtomicU64::new(0));
         let last_scan: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
         let watch_stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
@@ -50,7 +102,8 @@ impl FileIndex {
         let watcher = Self::start_watcher(needs_refresh_clone, watch_stop_clone);
 
         // 启动后台扫描 + 刷新检查线程
-        let files_clone = Arc::clone(&files);
+        let entries_clone = Arc::clone(&entries);
+        let version_clone = Arc::clone(&version);
         let last_scan_clone = Arc::clone(&last_scan);
         let ready_clone = Arc::clone(&ready);
         let needs_refresh_clone = Arc::clone(&needs_refresh);
@@ -58,7 +111,8 @@ impl FileIndex {
 
         thread::spawn(move || {
             Self::background_scan_loop(
-                files_clone,
+                entries_clone,
+                version_clone,
                 last_scan_clone,
                 ready_clone,
                 needs_refresh_clone,
@@ -67,7 +121,9 @@ impl FileIndex {
         });
 
         Self {
-            files,
+            entries,
+            version,
+            search_cache: Mutex::new(None),
             last_scan,
             watch_stop,
             ready,
@@ -116,15 +172,10 @@ impl FileIndex {
                         // 只关注文件创建/删除/修改事件
                         match event.kind {
                             EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
-                                // 过滤 .git 等无关目录的变化
-                                let paths = &event.paths;
-                                let should_refresh = paths.iter().any(|p| {
-                                    let path_str = p.to_string_lossy();
-                                    // 忽略 .git、.jcli/worktrees 等目录的变化
-                                    !path_str.starts_with(".git/")
-                                        && !path_str.starts_with(".jcli/worktrees/")
-                                        && !path_str.contains("/.git/")
-                                });
+                                let should_refresh = event
+                                    .paths
+                                    .iter()
+                                    .any(|p| !is_watch_ignored_path(p));
                                 if should_refresh {
                                     needs_refresh.store(true, Ordering::Relaxed);
                                     write_info_log(
@@ -156,7 +207,8 @@ impl FileIndex {
 
     /// 后台扫描循环：定期检查 needs_refresh 标记，触发重新扫描
     fn background_scan_loop(
-        files: Arc<Mutex<Vec<String>>>,
+        entries: Arc<Mutex<Arc<Vec<FileEntry>>>>,
+        version: Arc<AtomicU64>,
         last_scan: Arc<Mutex<Instant>>,
         ready: Arc<AtomicBool>,
         needs_refresh: Arc<AtomicBool>,
@@ -175,10 +227,12 @@ impl FileIndex {
                 // 执行扫描
                 let new_files = Self::scan_files_internal();
 
-                // 更新缓存
-                if let Ok(mut guard) = files.lock() {
-                    *guard = new_files;
+                // 更新缓存快照并递增版本（先替换快照再 bump，保证查询缓存与新版本对应）
+                let count = new_files.len();
+                if let Ok(mut guard) = entries.lock() {
+                    *guard = Arc::new(new_files);
                 }
+                version.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut guard) = last_scan.lock() {
                     *guard = Instant::now();
                 }
@@ -189,11 +243,7 @@ impl FileIndex {
                     "[FileIndex::scan_loop]",
                     &format!(
                         "扫描完成，共 {} 个文件，耗时 {}ms",
-                        if let Ok(guard) = files.lock() {
-                            guard.len()
-                        } else {
-                            0
-                        },
+                        count,
                         elapsed.as_millis()
                     ),
                 );
@@ -206,8 +256,16 @@ impl FileIndex {
         write_info_log("[FileIndex::scan_loop]", "后台扫描线程已退出");
     }
 
+    /// 获取当前条目快照（clone Arc 为 O(1)，匹配在无锁快照上进行）
+    fn snapshot(&self) -> Arc<Vec<FileEntry>> {
+        self.entries
+            .lock()
+            .map(|guard| Arc::clone(&guard))
+            .unwrap_or_else(|_| Arc::new(Vec::new()))
+    }
+
     /// 执行目录扫描的核心逻辑（复用现有 WalkBuilder 配置）
-    fn scan_files_internal() -> Vec<String> {
+    fn scan_files_internal() -> Vec<FileEntry> {
         let search_root = Path::new(".");
         let walker = WalkBuilder::new(search_root)
             .hidden(false)
@@ -217,7 +275,7 @@ impl FileIndex {
             .max_depth(Some(8))
             .build();
 
-        let mut files: Vec<String> = Vec::new();
+        let mut files: Vec<FileEntry> = Vec::new();
         for entry in walker.flatten() {
             let path = entry.path();
             // 跳过根目录本身
@@ -243,23 +301,32 @@ impl FileIndex {
                 continue;
             }
 
-            let is_dir = path.is_dir();
+            // 遍历时已携带 file_type，避免对每个条目再 stat 一次
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+
             let display = if is_dir {
                 format!("{}/", rel_str)
             } else {
                 rel_str.to_string()
             };
-            files.push(display);
+
+            let lower = display.to_lowercase();
+            let name_lower = file_name_of(&display).to_lowercase();
+            files.push(FileEntry {
+                display,
+                lower,
+                name_lower,
+            });
         }
 
         // 排序：目录优先，然后按名称排序
         files.sort_by(|a, b| {
-            let a_dir = a.ends_with('/');
-            let b_dir = b.ends_with('/');
+            let a_dir = a.display.ends_with('/');
+            let b_dir = b.display.ends_with('/');
             match (a_dir, b_dir) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.to_lowercase().cmp(&b.to_lowercase()),
+                _ => a.lower.cmp(&b.lower),
             }
         });
 
@@ -268,11 +335,7 @@ impl FileIndex {
 
     /// 获取所有缓存的文件路径（用于渲染，只读）
     pub fn files(&self) -> Vec<String> {
-        if let Ok(guard) = self.files.lock() {
-            guard.clone()
-        } else {
-            Vec::new()
-        }
+        self.snapshot().iter().map(|e| e.display.clone()).collect()
     }
 
     /// 缓存是否就绪
@@ -286,7 +349,7 @@ impl FileIndex {
     /// 从缓存中匹配该目录下的文件/子目录。
     #[allow(dead_code)]
     pub fn filter_by_prefix(&self, filter: &str) -> Vec<String> {
-        let files = self.files();
+        let snapshot = self.snapshot();
 
         // 处理 ~ 路径展开（仅用于显示，不实际展开）
         let effective_filter = if filter.starts_with("~/") {
@@ -303,13 +366,13 @@ impl FileIndex {
             let prefix_lower = prefix.to_lowercase();
 
             let mut entries: Vec<String> = Vec::new();
-            for path in &files {
+            for entry in snapshot.iter() {
                 // 检查是否以 dir_part 开头
-                if !path.starts_with(dir_part) {
+                if !entry.display.starts_with(dir_part) {
                     continue;
                 }
                 // 提取该目录下的名称
-                let after_dir = &path[dir_part.len()..];
+                let after_dir = &entry.display[dir_part.len()..];
                 // 检查是否有更深层的路径（不匹配）
                 if after_dir.contains('/') && !after_dir.ends_with('/') {
                     continue;
@@ -323,7 +386,7 @@ impl FileIndex {
                 if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                     continue;
                 }
-                entries.push(path.clone());
+                entries.push(entry.display.clone());
             }
             entries.truncate(15);
             return entries;
@@ -332,84 +395,91 @@ impl FileIndex {
         // 无 / 时，直接前缀匹配文件名
         let filter_lower = effective_filter.to_lowercase();
         let mut entries: Vec<String> = Vec::new();
-        for path in &files {
-            let name = if let Some(stripped) = path.strip_suffix('/') {
-                stripped
-            } else {
-                path.as_str()
-            };
-            // 取最后一段（文件名/目录名）
-            let file_name = if let Some(slash) = name.rfind('/') {
-                &name[slash + 1..]
-            } else {
-                name
-            };
-            if file_name.to_lowercase().starts_with(&filter_lower) {
-                entries.push(path.clone());
+        for entry in snapshot.iter() {
+            let name = file_name_of(&entry.display);
+            if name.to_lowercase().starts_with(&filter_lower) {
+                entries.push(entry.display.clone());
             }
         }
         entries.truncate(15);
         entries
     }
 
-    /// 模糊搜索文件（替换 WalkBuilder 扫描）
+    /// 模糊搜索文件（内存快照匹配 + 查询缓存）
     ///
     /// 使用增强版模糊匹配：文件名匹配 + 评分排序。
     /// max_results 限制返回数量。
     pub fn fuzzy_search(&self, filter: &str, max_results: usize) -> Vec<String> {
-        if filter.is_empty() {
-            // 返回前 max_results 个文件（已排序）
-            let files = self.files();
-            return files.into_iter().take(max_results).collect();
-        }
+        let version = self.version.load(Ordering::Relaxed);
 
-        let files = self.files();
-        let filter_lower = filter.to_lowercase();
-
-        let mut scored: Vec<(i32, String)> = Vec::new();
-        for path in &files {
-            let name = if let Some(stripped) = path.strip_suffix('/') {
-                stripped
-            } else {
-                path.as_str()
-            };
-
-            // 取文件名部分
-            let file_name = if let Some(slash) = name.rfind('/') {
-                &name[slash + 1..]
-            } else {
-                name
-            };
-
-            // 模糊匹配
-            if let Some(score) = Self::fuzzy_match_enhanced(file_name, &filter_lower, path) {
-                scored.push((score, path.clone()));
+        // 同一索引版本 + 同一过滤条件的重复查询直接复用
+        //（弹窗每帧渲染、上下键导航都会以相同参数重查）
+        if let Ok(guard) = self.search_cache.lock() {
+            if let Some(hit) = guard.as_ref()
+                && hit.version == version
+                && hit.filter == filter
+                && hit.max_results == max_results
+            {
+                return hit.results.clone();
             }
         }
 
-        // 按分数排序
-        scored.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-        });
+        let snapshot = self.snapshot();
 
-        scored
-            .into_iter()
-            .take(max_results)
-            .map(|(_, path)| path)
-            .collect()
+        let results: Vec<String> = if filter.is_empty() {
+            // 返回前 max_results 个文件（已排序）
+            snapshot
+                .iter()
+                .take(max_results)
+                .map(|e| e.display.clone())
+                .collect()
+        } else {
+            let filter_lower = filter.to_lowercase();
+
+            let mut scored: Vec<(i32, usize)> = Vec::new();
+            for (idx, entry) in snapshot.iter().enumerate() {
+                let file_name = file_name_of(&entry.display);
+
+                // 模糊匹配
+                if let Some(score) = Self::fuzzy_match_enhanced(file_name, &filter_lower, entry) {
+                    scored.push((score, idx));
+                }
+            }
+
+            // 按分数排序
+            scored.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| snapshot[a.1].lower.cmp(&snapshot[b.1].lower))
+            });
+
+            scored
+                .into_iter()
+                .take(max_results)
+                .map(|(_, idx)| snapshot[idx].display.clone())
+                .collect()
+        };
+
+        if let Ok(mut guard) = self.search_cache.lock() {
+            *guard = Some(SearchCache {
+                version,
+                filter: filter.to_string(),
+                max_results,
+                results: results.clone(),
+            });
+        }
+
+        results
     }
 
     /// 增强版模糊匹配：返回匹配分数（越小越好）
-    fn fuzzy_match_enhanced(file_name: &str, filter: &str, rel_path: &str) -> Option<i32> {
-        let base_score = Self::fuzzy_match(file_name, filter)?;
+    fn fuzzy_match_enhanced(file_name: &str, filter_lower: &str, entry: &FileEntry) -> Option<i32> {
+        let base_score = Self::fuzzy_match(&entry.name_lower, filter_lower)?;
 
         // 匹配位置加成：开头匹配更优
-        let file_name_lower = file_name.to_lowercase();
-        let position_bonus = if file_name_lower.starts_with(filter) {
-            -50 // 开头匹配，大幅加分
-        } else if file_name_lower.contains(filter) {
-            -20 // 包含匹配，中等加分
+        let position_bonus = if entry.name_lower.starts_with(filter_lower) {
+            NAME_PREFIX_SCORE_BONUS
+        } else if entry.name_lower.contains(filter_lower) {
+            NAME_CONTAINS_SCORE_BONUS
         } else {
             0
         };
@@ -417,51 +487,53 @@ impl FileIndex {
         // 扩展名优先级：代码文件更优
         let ext_bonus = if let Some(ext) = Path::new(file_name).extension() {
             let ext_str = ext.to_string_lossy().to_lowercase();
-            match ext_str.as_str() {
-                "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt" | "swift" => -15,
-                "json" | "yaml" | "yml" | "toml" | "md" => -10,
-                _ => 0,
+            if SCORE_BOOSTED_CODE_EXTS.contains(&ext_str.as_str()) {
+                CODE_EXT_SCORE_BONUS
+            } else if SCORE_BOOSTED_DOC_EXTS.contains(&ext_str.as_str()) {
+                DOC_EXT_SCORE_BONUS
+            } else {
+                0
             }
         } else {
             0
         };
 
         // 路径深度惩罚
-        let depth = rel_path.matches('/').count() as i32;
+        let depth = entry.display.matches('/').count() as i32;
 
         Some(base_score * 10 + depth + position_bonus + ext_bonus)
     }
 
     /// 模糊匹配：filter 的每个字符按顺序出现在 text 中即可匹配
-    fn fuzzy_match(text: &str, filter: &str) -> Option<i32> {
-        if filter.is_empty() {
+    ///
+    /// 入参均应为小写，逐字符流式比较，不产生中间分配
+    fn fuzzy_match(text_lower: &str, filter_lower: &str) -> Option<i32> {
+        if filter_lower.is_empty() {
             return Some(0);
         }
-        let text_lower: Vec<char> = text.to_lowercase().chars().collect();
-        let filter_lower: Vec<char> = filter.to_lowercase().chars().collect();
-        let mut ti = 0;
+
+        let mut filter_chars = filter_lower.chars();
+        let Some(mut fc) = filter_chars.next() else {
+            return Some(0);
+        };
+
         let mut score: i32 = 0;
         let mut last_match: Option<usize> = None;
-        for &fc in &filter_lower {
-            let mut found = false;
-            while ti < text_lower.len() {
-                if text_lower[ti] == fc {
-                    // 连续匹配加分（间距小更好）
-                    if let Some(lm) = last_match {
-                        score += (ti - lm - 1) as i32;
-                    }
-                    last_match = Some(ti);
-                    ti += 1;
-                    found = true;
-                    break;
+        for (ti, tc) in text_lower.chars().enumerate() {
+            if tc == fc {
+                // 连续匹配加分（间距小更好）
+                if let Some(lm) = last_match {
+                    score += (ti - lm - 1) as i32;
                 }
-                ti += 1;
-            }
-            if !found {
-                return None;
+                last_match = Some(ti);
+
+                match filter_chars.next() {
+                    Some(next) => fc = next,
+                    None => return Some(score),
+                }
             }
         }
-        Some(score)
+        None
     }
 
     /// 主动触发一次重新扫描（弹窗打开时调用）
@@ -474,6 +546,34 @@ impl FileIndex {
         self.watch_stop.store(true, Ordering::Relaxed);
         write_info_log("[FileIndex]", "已标记停止，后台线程将退出");
     }
+}
+
+/// 提取显示路径的文件名部分（目录条目先去掉尾部 '/'）
+fn file_name_of(display: &str) -> &str {
+    let name = display.strip_suffix('/').unwrap_or(display);
+
+    match name.rfind('/') {
+        Some(i) => &name[i + 1..],
+        None => name,
+    }
+}
+
+/// 判断 watcher 事件路径是否应被忽略（.git、.jcli/worktrees、构建产物目录）
+fn is_watch_ignored_path(p: &Path) -> bool {
+    let path_str = p.to_string_lossy();
+
+    if path_str.starts_with(".git/")
+        || path_str.starts_with(".jcli/worktrees/")
+        || path_str.contains("/.git/")
+    {
+        return true;
+    }
+
+    // 构建产物目录：按路径段匹配（事件路径可能带 "./" 前缀）
+    p.iter().any(|seg| {
+        let seg = seg.to_string_lossy();
+        BUILD_DIR_SEGMENTS.contains(&seg.as_ref())
+    })
 }
 
 impl Default for FileIndex {
@@ -494,7 +594,7 @@ impl Drop for FileIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::FileIndex;
+    use super::{FileIndex, file_name_of};
 
     #[test]
     fn fuzzy_match_basic() {
@@ -506,5 +606,12 @@ mod tests {
     #[test]
     fn fuzzy_match_empty_filter() {
         assert_eq!(FileIndex::fuzzy_match("anything", ""), Some(0));
+    }
+
+    #[test]
+    fn file_name_of_basic() {
+        assert_eq!(file_name_of("src/main.rs"), "main.rs");
+        assert_eq!(file_name_of("src/lib/"), "lib");
+        assert_eq!(file_name_of("README.md"), "README.md");
     }
 }
